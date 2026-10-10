@@ -1,0 +1,9 @@
+# Holds your API key
+config.json
+
+__pycache__/
+*.pyc
+
+# Downloaded galleries/collections (folders named "Name (G0000...)" / "(C0000...)")
+*(G0000*)/
+*(C0000*)/

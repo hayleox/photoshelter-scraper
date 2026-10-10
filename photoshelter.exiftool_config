@@ -1,0 +1,33 @@
+# ExifTool config defining a custom XMP namespace for PhotoShelter-specific
+# metadata that has no standard home (media/gallery IDs and PhotoShelter's own
+# timestamps). Loaded by scrape.py via `exiftool -config`.
+#
+# To read these tags back out:
+#   exiftool -config photoshelter.exiftool_config -XMP-photoshelter:all FILE.jpg
+
+%Image::ExifTool::UserDefined = (
+    'Image::ExifTool::XMP::Main' => {
+        photoshelter => {
+            SubDirectory => {
+                TagTable => 'Image::ExifTool::UserDefined::photoshelter',
+            },
+        },
+    },
+);
+
+%Image::ExifTool::UserDefined::photoshelter = (
+    GROUPS => { 0 => 'XMP', 1 => 'XMP-photoshelter', 2 => 'Image' },
+    NAMESPACE => { 'photoshelter' => 'https://www.photoshelter.com/ns/photoshelter/1.0/' },
+    WRITABLE => 'string',
+    MediaID          => { },
+    GalleryID        => { },
+    OrganizationID   => { },
+    OriginalWidth    => { Writable => 'integer' },
+    OriginalHeight   => { Writable => 'integer' },
+    OriginalFileSize => { Writable => 'integer' },
+    UploadDate       => { Writable => 'date' },  # media created_at
+    ModifyDate       => { Writable => 'date' },  # media modified_at
+    GalleryAddDate   => { Writable => 'date' },  # gallery child creation_time
+);
+
+1;  # end

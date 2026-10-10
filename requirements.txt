@@ -1,0 +1,2 @@
+httpx
+pyrate-limiter>=4.0
