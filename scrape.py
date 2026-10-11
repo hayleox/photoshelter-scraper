@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
 """Download a PhotoShelter gallery or collection with its metadata embedded.
 
-Accepts a gallery/collection ID or a PhotoShelter URL. Collections are walked
+Accepts a gallery/collection ID or a PhotoShelter URL; a site URL with no ID
+downloads everything the site lists publicly. Collections are walked
 recursively, recreating their folder tree locally. Every item (photos, videos,
 documents, ...) is downloaded as the original file where permitted. Otherwise
 the best preview PhotoShelter offers is saved instead, marked ".thumb": a
@@ -126,8 +127,8 @@ class Unavailable(Exception):
 
 
 class PhotoShelter:
-    def __init__(self, site, api_key, requests_per_second):
-        self.base = f"https://{site}.photoshelter.com/psapi/v4.0"
+    def __init__(self, host, api_key, requests_per_second):
+        self.base = f"https://{host}/psapi/v4.0"
         self.limiter = Limiter(Rate(requests_per_second, Duration.SECOND))
         self.client = httpx.Client(
             timeout=120,
@@ -170,6 +171,18 @@ class PhotoShelter:
         if isinstance(parents, dict):
             parents = [parents]
         return data, [p["id"] for p in parents if p.get("type") == "collection"]
+
+    def portal(self):
+        """A site's top-level public collections and galleries (what its
+        library/home page lists). PhotoShelter works out which site from the
+        hostname the request is sent to."""
+        resp = self.api("portal")
+        items = resp["data"]
+        total = resp["meta"].get("children_count", {}).get("total", len(items))
+        if total > len(items):
+            # Documented to return everything (it has no paging parameters)
+            print(f"warning: portal says it has {total} items but returned {len(items)}")
+        return items
 
     def collection_children(self, collection_id):
         return list(self._paged(f"collections/{collection_id}/children"))
@@ -251,18 +264,22 @@ class PhotoShelter:
 # Target parsing
 # --------------------------------------------------------------------------- #
 def parse_target(target):
-    """Turn an ID or PhotoShelter URL into (site, kind, id, collection_ctx).
+    """Turn an ID or PhotoShelter URL into (host, kind, id, collection_ctx).
 
-    site is None when the target is a bare ID (caller supplies the default).
-    collection_ctx is the parent collection a gallery URL was browsed through,
-    passed to permission-scoped endpoints; None otherwise.
+    host is the PhotoShelter hostname to send API requests to, or None for a
+    bare ID or a non-PhotoShelter URL (caller supplies the default). kind is
+    "gallery", "collection", or "portal" (a site's top level, where id is the
+    site name). collection_ctx is the parent collection a gallery URL was
+    browsed through, passed to permission-scoped endpoints; None otherwise.
     """
-    site, path = None, target
+    host, path = None, target
     if "://" in target or target.startswith("www."):
         parsed = urlparse(target if "://" in target else f"https://{target}")
-        host = parsed.hostname or ""
-        if host.endswith(".photoshelter.com"):
-            site = host[: -len(".photoshelter.com")]
+        hostname = parsed.hostname or ""
+        # Both classic sites (name.photoshelter.com) and newer ones
+        # (name.photoshelter.site) serve the API on their own hostname
+        if hostname.endswith((".photoshelter.com", ".photoshelter.site")):
+            host = hostname
         path = parsed.path
 
     collections = COLLECTION_RE.findall(path)
@@ -272,9 +289,14 @@ def parse_target(target):
         # A collection appearing before the gallery in a URL is its browse
         # context; use it so gallery/collection permissions resolve.
         context = collections[-1] if collections else None
-        return site, "gallery", gallery_id, context
+        return host, "gallery", gallery_id, context
     if collections:
-        return site, "collection", collections[-1], None
+        return host, "collection", collections[-1], None
+    site_name = host.split(".")[0] if host else None
+    if site_name and site_name != "www":
+        # A site URL with no ID in it (home page, /library, ...): download the
+        # site's portal, i.e. everything it shows publicly at its top level
+        return host, "portal", site_name, None
     raise ValueError(f"no gallery (G0000...) or collection (C0000...) ID found in {target!r}")
 
 
@@ -512,7 +534,9 @@ class Scraper:
         self.original = self.preview = self.missing = self.skipped = self.failed = 0
 
     def run(self, kind, obj_id, collection_ctx):
-        if kind == "collection":
+        if kind == "portal":
+            self.walk_portal(obj_id, self.args.output)
+        elif kind == "collection":
             self.walk_collection(self.ps.get_collection(obj_id), self.args.output)
         else:
             node, parents = self.ps.get_gallery(obj_id)
@@ -527,30 +551,50 @@ class Scraper:
         )
         return 1 if self.failed else 0
 
+    def walk_portal(self, site_name, parent_dir):
+        # The portal response has no name or ID of its own, so the folder is
+        # named after the site
+        folder = parent_dir / sanitize(site_name)
+        print(f"\nSite: {folder.name}")
+        folder.mkdir(parents=True, exist_ok=True)
+        items = self.ps.portal()
+        if not items:
+            print(
+                "  The site doesn't list anything publicly. Unlisted collections and "
+                "galleries can still be downloaded from their own URLs."
+            )
+        for child in items:
+            # Top-level galleries have no parent collection to use as context
+            self.handle_child(child, folder, None)
+
     def walk_collection(self, node, parent_dir):
         folder = parent_dir / folder_name(node["attributes"]["name"], node["id"])
         print(f"\nCollection: {folder.name}")
         folder.mkdir(parents=True, exist_ok=True)
         for child in self.ps.collection_children(node["id"]):
-            try:
-                if child["type"] == "gallery":
-                    self.handle_gallery(child, folder, node["id"])
-                elif child["type"] == "collection":
-                    self.walk_collection(child, folder)
-                else:
-                    print(f"  skipping {child['id']}: unknown type {child['type']!r}")
-            except httpx.HTTPStatusError as e:
-                if e.response.status_code not in (401, 403, 404):
-                    raise
-                # Can't list it at all: leave a note where its folder would be
-                name = folder_name(child["attributes"].get("name"), child["id"])
-                (folder / f"{name}.MISSING.txt").write_text(
-                    f"The {child['type']} {name} couldn't be opened "
-                    f"(HTTP {e.response.status_code}), so its contents weren't downloaded.\n"
-                    "Re-running the scraper will try again.\n"
-                )
-                print(f"  {name}: no access (HTTP {e.response.status_code}), wrote placeholder")
-                self.missing += 1
+            self.handle_child(child, folder, node["id"])
+
+    def handle_child(self, child, folder, collection_ctx):
+        """A gallery or collection listed inside folder."""
+        try:
+            if child["type"] == "gallery":
+                self.handle_gallery(child, folder, collection_ctx)
+            elif child["type"] == "collection":
+                self.walk_collection(child, folder)
+            else:
+                print(f"  skipping {child['id']}: unknown type {child['type']!r}")
+        except httpx.HTTPStatusError as e:
+            if e.response.status_code not in (401, 403, 404):
+                raise
+            # Can't list it at all: leave a note where its folder would be
+            name = folder_name(child["attributes"].get("name"), child["id"])
+            (folder / f"{name}.MISSING.txt").write_text(
+                f"The {child['type']} {name} couldn't be opened "
+                f"(HTTP {e.response.status_code}), so its contents weren't downloaded.\n"
+                "Re-running the scraper will try again.\n"
+            )
+            print(f"  {name}: no access (HTTP {e.response.status_code}), wrote placeholder")
+            self.missing += 1
 
     def handle_gallery(self, node, parent_dir, collection_ctx):
         folder = parent_dir / folder_name(node["attributes"]["name"], node["id"])
@@ -688,7 +732,10 @@ def load_api_key(override):
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
-    parser.add_argument("target", help="gallery/collection ID or a PhotoShelter URL")
+    parser.add_argument(
+        "target",
+        help="gallery/collection ID, or a PhotoShelter URL (a site URL with no ID downloads the whole site)",
+    )
     parser.add_argument(
         "-o", "--output", type=Path, default=Path("."),
         help="parent directory for the downloaded tree (default: current directory)",
@@ -704,16 +751,16 @@ def main():
         sys.exit("exiftool not found; install it first (see requirements.txt)")
 
     try:
-        url_site, kind, obj_id, collection_ctx = parse_target(args.target)
+        url_host, kind, obj_id, collection_ctx = parse_target(args.target)
     except ValueError as e:
         sys.exit(str(e))
 
     api_key = load_api_key(args.api_key)
-    site = args.site or url_site or DEFAULT_SITE
+    host = f"{args.site}.photoshelter.com" if args.site else url_host or f"{DEFAULT_SITE}.photoshelter.com"
     args.output.mkdir(parents=True, exist_ok=True)
 
-    ps = PhotoShelter(site, api_key, args.rate)
-    print(f"Site: {site}.photoshelter.com | {kind} {obj_id}")
+    ps = PhotoShelter(host, api_key, args.rate)
+    print(f"Host: {host} | {kind} {obj_id}")
     sys.exit(Scraper(ps, args).run(kind, obj_id, collection_ctx))
 
 

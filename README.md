@@ -1,6 +1,6 @@
 # photoshelter-scraper
 
-Downloads everything in a PhotoShelter gallery or collection (photos, videos, documents, ...), with metadata embedded where possible. Collections are walked recursively and their folder tree is recreated locally. Every item is downloaded as its **original** file where PhotoShelter permits it; otherwise the best available preview is saved instead, marked `.thumb`.
+Downloads everything in a PhotoShelter gallery, collection, or whole site (photos, videos, documents, ...), with metadata embedded where possible. Collections are walked recursively and their folder tree is recreated locally. Every item is downloaded as its **original** file where PhotoShelter permits it; otherwise the best available preview is saved instead, marked `.thumb`.
 
 This tool uses the v4.0 API, documented here: <https://engineering.photoshelter.com/psapi-v4-doc/>. Older sites using the v3 API have not been investigated/tested as of yet.
 
@@ -32,16 +32,23 @@ The API key lives in `config.json` (`{"api_key": "..."}`). If it's missing the t
 
 ## Usage
 
-Pass a gallery/collection ID or any PhotoShelter URL — the IDs are pulled out of the URL path:
+Pass a gallery/collection ID or any PhotoShelter URL. Both classic sites (`example.photoshelter.com`) and newer ones (`example.photoshelter.site`) work; the IDs are pulled out of the URL path:
 
 ```sh
 ./scrape.py G0000XXXXXXXXXXX
 ./scrape.py https://example.photoshelter.com/galleries/C0000XXXXXXXXXXX/G0000XXXXXXXXXXX/example
 ./scrape.py https://example.photoshelter.com/galleries/C0000XXXXXXXXXXX/example
+./scrape.py https://example.photoshelter.site/library/show/C0000XXXXXXXXXXX/G0000XXXXXXXXXXX
+```
+
+A site URL with no ID in it (its home page, or `/library` on a `.photoshelter.site` site) downloads the whole site: everything listed publicly at its top level, via the API's `/portal` endpoint. Unlisted collections and galleries don't appear there, but can still be downloaded from their own URLs.
+
+```sh
+./scrape.py https://example.photoshelter.site/library
 ```
 
 - `-o DIR` — parent directory for the download tree (default: current directory)
-- `--site` — PhotoShelter subdomain; taken from the URL if given, else `www`
+- `--site` — send API requests to `SITE.photoshelter.com`; by default they go to the URL's own host, or `www` for a bare ID
 - `--api-key` — override the key in `config.json`
 - `--rate N` — max requests/second (default 5)
 - `--force` — re-download files that already exist
@@ -51,13 +58,14 @@ Files that already exist (original or `.thumb`) are skipped, so an interrupted r
 
 ## Output layout
 
-Every collection and gallery becomes a folder named `Name (ID)`; files sit inside their gallery's folder, named with PhotoShelter's `file_name`:
+Every collection and gallery becomes a folder named `Name (ID)`; files sit inside their gallery's folder, named with PhotoShelter's `file_name`. A whole-site download goes in a folder named after the site (the portal listing has no name or ID of its own):
 
 ```
-Some Collection (C0000XXXXXXXXXXX)/
-  Some Gallery (G0000XXXXXXXXXXX)/
-    Some File Name.ext
-    ...
+example/
+  Some Collection (C0000XXXXXXXXXXX)/
+    Some Gallery (G0000XXXXXXXXXXX)/
+      Some File Name.ext
+      ...
 ```
 
 When two items in a gallery share a name (ignoring case and extension), each gets its media ID appended: `Ambiguous Name (I0000XXXXXXXXXXX).thumb.jpg`. Names are PhotoShelter's, so the extension doesn't always match the contents.
@@ -89,4 +97,5 @@ When two items in a gallery share a name (ignoring case and extension), each get
 - The original download is requested with the gallery/collection context so permissions resolve correctly; a permission denial is the signal to fall back to a preview. Galleries that inherit access from their collection can't be read without that context, so for a bare gallery ID the tool looks up its parent collection (bundled into the gallery request via `include=parent`).
 - A file that was saved as a preview is skipped on later runs, like any existing file. If you're later given access to the originals, re-run with `--force` (which also removes the old `.thumb` file when an original replaces it).
 - Documents' gallery `creation_time` comes back as `2024-08-15 19:12:20 GMT` rather than ISO 8601 (the `date_format` parameter doesn't change it).
+- The `/library` endpoint needs a logged-in user, even though a site's library page is public. The public equivalent is `/portal`, which works out which site to list from the hostname the request is sent to (or an `org_id`/`user_id` parameter).
 - Some uploads are empty (0 bytes, format `inode/x-empty`). They're saved as the same empty files and flagged in the output.
